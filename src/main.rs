@@ -1,18 +1,16 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
-// Removed unused ListUtf8ChunkedBuilder, added ListStringChunkedBuilder just in case, but not used in final approach
-use polars::chunked_array::builder::{
-    ListBooleanChunkedBuilder, ListBuilderTrait, ListPrimitiveChunkedBuilder,
-};
+
 // Import CategoricalOrdering and SortOptions
-use polars::datatypes::{CategoricalOrdering, DataType, Field, Int64Type, TimeUnit};
+use polars::datatypes::{CategoricalOrdering, DataType, TimeUnit};
 use polars::prelude::*; // Includes StringChunkedBuilder, SortOptions etc.
+mod query_stats;
+use query_stats::QueryStats;
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
-use std::sync::Arc; // Needed for Categorical RevMapping potentially, and Field
 use std::time::{Duration as StdDuration, Instant}; // Renamed to avoid conflict
 use uuid::Uuid;
 
@@ -275,121 +273,125 @@ fn get_field_values_by_doc_ids_refactored(
     doc_ids: &[i64],
     file_path: &str,
     low_memory: bool,
-) -> PolarsResult<FieldValueResult> {
-    println!(
-        "Querying get_field_values_by_doc_ids_refactored for field '{}' with {} doc_ids",
+) -> PolarsResult<(FieldValueResult, QueryStats)> {
+    let mut stats = QueryStats::new(
+        "get_field_values_by_doc_ids",
         field_name,
-        doc_ids.len()
+        Some(doc_ids.len()),
     );
-    let start_time = Instant::now();
-    let args = ScanArgsParquet {
-        low_memory,
-        ..Default::default()
-    };
+    let overall_start = Instant::now();
+
+    // Setup phase
+    let args = time_section!(stats, setup, {
+        println!(
+            "Querying get_field_values_by_doc_ids for field '{}' with {} doc_ids",
+            field_name,
+            doc_ids.len()
+        );
+        ScanArgsParquet {
+            low_memory,
+            ..Default::default()
+        }
+    });
+
     let lf = LazyFrame::scan_parquet(file_path, args)?;
     let column_name = field_name_to_column(field_name);
 
-    // 1. Create filter DataFrame (Fixed: Use SortOptions)
-    let filter_df = df! (
-        "doc_id" => doc_ids,
-    )?
-    .lazy()
-    .sort(["doc_id"], SortMultipleOptions::default()); // Use SortOptions
+    // Filter creation phase
+    let filter_df = time_section!(stats, filter_creation, {
+        df! (
+            "doc_id" => doc_ids,
+        )?
+        .lazy()
+        .sort(["doc_id"], SortMultipleOptions::default())
+    });
 
-    // 2. Perform Inner Join
-    let filtered_lf = lf.join(
-        filter_df,
-        [col("doc_id")],
-        [col("doc_id")],
-        JoinArgs::new(JoinType::Inner),
-    );
+    // Join operation phase
+    let filtered_lf = time_section!(stats, join_operation, {
+        lf.join(
+            filter_df,
+            [col("doc_id")],
+            [col("doc_id")],
+            JoinArgs::new(JoinType::Inner),
+        )
+        .select([col(&column_name), col("doc_id")])
+    });
 
-    // 3. Select necessary columns
-    let result_lf = filtered_lf.select([col(&column_name), col("doc_id")]);
+    // Collect phase
+    let df = time_section!(stats, collect, { filtered_lf.collect()? });
+    stats.set_result_rows(df.height());
 
-    // 4. Collect DataFrame
-    let df = result_lf.collect()?;
-    let collect_time = start_time.elapsed();
-    println!(
-        "Collected DataFrame for get_field_values_by_doc_ids_refactored, height: {}, took {:?}",
-        df.height(),
-        collect_time
-    );
+    // Processing phase
+    let value_map = time_section!(stats, processing, {
+        let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+        if df.height() > 0 {
+            let field_col = df.column(&column_name)?;
+            let ids_col = df.column("doc_id")?;
+            let ids_ca = ids_col.i64()?;
 
-    let group_time_start = Instant::now();
-
-    // 5. Perform grouping in Rust (Fixed: Use DataType::String, corrected Categorical match)
-    let mut value_map: HashMap<String, Vec<i64>> = HashMap::new();
-    if df.height() > 0 {
-        let field_col = df.column(&column_name)?;
-        let ids_col = df.column("doc_id")?;
-        let ids_ca = ids_col.i64()?;
-
-        match field_col.dtype() {
-            // Match requires full pattern including ordering
-            DataType::Categorical(_, _) => {
-                // Match any Categorical
-                let field_ca = field_col.categorical()?;
-                field_ca
-                    .iter_str()
-                    .zip(ids_ca.into_iter())
-                    .for_each(|(key_opt, id_opt)| {
-                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
-                            value_map.entry(key.to_string()).or_default().push(id);
-                        }
-                    });
-            }
-            DataType::String => {
-                // Use String instead of Utf8
-                let field_ca = field_col.str()?; // Use .str() accessor
-                field_ca
-                    .into_iter()
-                    .zip(ids_ca.into_iter())
-                    .for_each(|(key_opt, id_opt)| {
-                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
-                            value_map.entry(key.to_string()).or_default().push(id);
-                        }
-                    });
-            }
-            DataType::Boolean => {
-                let field_ca = field_col.bool()?;
-                field_ca
-                    .into_iter()
-                    .zip(ids_ca.into_iter())
-                    .for_each(|(key_opt, id_opt)| {
-                        if let (Some(key_bool), Some(id)) = (key_opt, id_opt) {
-                            let key_str = key_bool.to_string();
-                            value_map.entry(key_str).or_default().push(id);
-                        }
-                    });
-            }
-            other_type => {
-                log::warn!(
-                    "Grouping column '{}' has unexpected type: {:?}. Trying AnyValue conversion.",
-                    column_name,
-                    other_type
-                );
-                for i in 0..df.height() {
-                    if let (Ok(key_any), Ok(id_any)) = (field_col.get(i), ids_col.get(i)) {
-                        if let AnyValue::Int64(id) = id_any {
-                            let key_str = key_any.to_string().trim_matches('"').to_string();
-                            value_map.entry(key_str).or_default().push(id);
+            match field_col.dtype() {
+                DataType::Categorical(_, _) => {
+                    let field_ca = field_col.categorical()?;
+                    field_ca
+                        .iter_str()
+                        .zip(ids_ca.into_iter())
+                        .for_each(|(key_opt, id_opt)| {
+                            if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                                map.entry(key.to_string()).or_default().push(id);
+                            }
+                        });
+                }
+                DataType::String => {
+                    let field_ca = field_col.str()?;
+                    field_ca
+                        .into_iter()
+                        .zip(ids_ca.into_iter())
+                        .for_each(|(key_opt, id_opt)| {
+                            if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                                map.entry(key.to_string()).or_default().push(id);
+                            }
+                        });
+                }
+                DataType::Boolean => {
+                    let field_ca = field_col.bool()?;
+                    field_ca
+                        .into_iter()
+                        .zip(ids_ca.into_iter())
+                        .for_each(|(key_opt, id_opt)| {
+                            if let (Some(key_bool), Some(id)) = (key_opt, id_opt) {
+                                let key_str = key_bool.to_string();
+                                map.entry(key_str).or_default().push(id);
+                            }
+                        });
+                }
+                other_type => {
+                    log::warn!(
+                        "Grouping column '{}' has unexpected type: {:?}. Trying AnyValue conversion.",
+                        column_name,
+                        other_type
+                    );
+                    for i in 0..df.height() {
+                        if let (Ok(key_any), Ok(id_any)) = (field_col.get(i), ids_col.get(i)) {
+                            if let AnyValue::Int64(id) = id_any {
+                                let key_str = key_any.to_string().trim_matches('"').to_string();
+                                map.entry(key_str).or_default().push(id);
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    let group_time = group_time_start.elapsed();
+        map
+    });
 
-    log::info!(
-        "get_field_values_by_doc_ids_refactored for '{}' took {:?} (Collect: {:?}, Group: {:?})",
-        field_name,
-        start_time.elapsed(),
-        collect_time,
-        group_time
-    );
-    Ok(FieldValueResult { value_map })
+    // Update total time
+    stats.timing.total = overall_start.elapsed();
+    stats.update_memory();
+
+    // Print summary
+    stats.print_summary();
+
+    Ok((FieldValueResult { value_map }, stats))
 }
 
 // --- REFACTORED get_field_values (Fixed) ---
@@ -397,104 +399,103 @@ fn get_field_values_refactored(
     field_name: &str,
     file_path: &str,
     low_memory: bool,
-) -> PolarsResult<FieldValueResult> {
+) -> PolarsResult<(FieldValueResult, QueryStats)> {
     println!(
         "Querying get_field_values_refactored for field '{}'",
         field_name
     );
-    let start_time = Instant::now();
-    let args = ScanArgsParquet {
-        low_memory,
-        ..Default::default()
-    };
+    let mut stats = QueryStats::new("get_field_values_refactored", field_name, None);
+    let overall_start = Instant::now();
+
+    // Setup phase: create scan arguments with timing
+    let args = time_section!(stats, setup, {
+        ScanArgsParquet {
+            low_memory,
+            ..Default::default()
+        }
+    });
     let lf = LazyFrame::scan_parquet(file_path, args)?;
     let column_name = field_name_to_column(field_name);
 
-    // 1. Select necessary columns
+    // Directly perform the select operation (no separate "select" timing available)
     let result_lf = lf.select([col(&column_name), col("doc_id")]);
 
-    // 2. Collect DataFrame
-    let df = result_lf.collect()?;
-    let collect_time = start_time.elapsed();
+    // Collect phase: materialize the DataFrame with timing
+    let df = time_section!(stats, collect, { result_lf.collect()? });
+    stats.set_result_rows(df.height());
     println!(
-        "Collected DataFrame for get_field_values_refactored, height: {}, took {:?}",
-        df.height(),
-        collect_time
+        "Collected DataFrame for get_field_values_refactored, height: {}",
+        df.height()
     );
 
-    let group_time_start = Instant::now();
-
-    // 3. Perform grouping in Rust (Fixed: Use DataType::String, corrected Categorical match)
-    let mut value_map: HashMap<String, Vec<i64>> = HashMap::new();
-    if df.height() > 0 {
-        let field_col = df.column(&column_name)?;
-        let ids_col = df.column("doc_id")?;
-        let ids_ca = ids_col.i64()?;
-
-        match field_col.dtype() {
-            DataType::Categorical(_, _) => {
-                // Match any Categorical
-                let field_ca = field_col.categorical()?;
-                field_ca
-                    .iter_str()
-                    .zip(ids_ca.into_iter())
-                    .for_each(|(key_opt, id_opt)| {
-                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
-                            value_map.entry(key.to_string()).or_default().push(id);
-                        }
-                    });
-            }
-            DataType::String => {
-                // Use String instead of Utf8
-                let field_ca = field_col.str()?; // Use .str() accessor
-                field_ca
-                    .into_iter()
-                    .zip(ids_ca.into_iter())
-                    .for_each(|(key_opt, id_opt)| {
-                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
-                            value_map.entry(key.to_string()).or_default().push(id);
-                        }
-                    });
-            }
-            DataType::Boolean => {
-                let field_ca = field_col.bool()?;
-                field_ca
-                    .into_iter()
-                    .zip(ids_ca.into_iter())
-                    .for_each(|(key_opt, id_opt)| {
-                        if let (Some(key_bool), Some(id)) = (key_opt, id_opt) {
-                            let key_str = key_bool.to_string();
-                            value_map.entry(key_str).or_default().push(id);
-                        }
-                    });
-            }
-            other_type => {
-                log::warn!(
-                    "Grouping column '{}' has unexpected type: {:?}. Trying AnyValue conversion.",
-                    column_name,
-                    other_type
-                );
-                for i in 0..df.height() {
-                    if let (Ok(key_any), Ok(id_any)) = (field_col.get(i), ids_col.get(i)) {
-                        if let AnyValue::Int64(id) = id_any {
-                            let key_str = key_any.to_string().trim_matches('"').to_string();
-                            value_map.entry(key_str).or_default().push(id);
+    // Processing phase (grouping): group 'field_name' values with timing
+    let value_map = time_section!(stats, processing, {
+        let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+        if df.height() > 0 {
+            let field_col = df.column(&column_name)?;
+            let ids_col = df.column("doc_id")?;
+            let ids_ca = ids_col.i64()?;
+            match field_col.dtype() {
+                DataType::Categorical(_, _) => {
+                    let field_ca = field_col.categorical()?;
+                    field_ca
+                        .iter_str()
+                        .zip(ids_ca.into_iter())
+                        .for_each(|(key_opt, id_opt)| {
+                            if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                                map.entry(key.to_string()).or_default().push(id);
+                            }
+                        });
+                }
+                DataType::String => {
+                    let field_ca = field_col.str()?;
+                    field_ca
+                        .into_iter()
+                        .zip(ids_ca.into_iter())
+                        .for_each(|(key_opt, id_opt)| {
+                            if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                                map.entry(key.to_string()).or_default().push(id);
+                            }
+                        });
+                }
+                DataType::Boolean => {
+                    let field_ca = field_col.bool()?;
+                    field_ca
+                        .into_iter()
+                        .zip(ids_ca.into_iter())
+                        .for_each(|(key_opt, id_opt)| {
+                            if let (Some(key_bool), Some(id)) = (key_opt, id_opt) {
+                                let key_str = key_bool.to_string();
+                                map.entry(key_str).or_default().push(id);
+                            }
+                        });
+                }
+                other_type => {
+                    log::warn!(
+                        "Grouping column '{}' has unexpected type: {:?}. Trying AnyValue conversion.",
+                        column_name,
+                        other_type
+                    );
+                    for i in 0..df.height() {
+                        if let (Ok(key_any), Ok(id_any)) = (field_col.get(i), ids_col.get(i)) {
+                            if let AnyValue::Int64(id) = id_any {
+                                let key_str = key_any.to_string().trim_matches('"').to_string();
+                                map.entry(key_str).or_default().push(id);
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    let group_time = group_time_start.elapsed();
+        map
+    });
 
-    log::info!(
-        "get_field_values_refactored for '{}' took {:?} (Collect: {:?}, Group: {:?})",
-        field_name,
-        start_time.elapsed(),
-        collect_time,
-        group_time
-    );
-    Ok(FieldValueResult { value_map })
+    // Update overall timing and memory usage
+    stats.timing.total = overall_start.elapsed();
+    stats.update_memory();
+    stats.print_summary();
+
+    Ok((FieldValueResult { value_map }, stats))
 }
 
 // --- Numeric Stats Struct (Unchanged) ---
@@ -511,38 +512,53 @@ fn get_numeric_stats_by_doc_ids_refactored(
     doc_ids: &[i64],
     file_path: &str,
     low_memory: bool,
-) -> PolarsResult<NumericStats> {
-    println!(
-        "Querying get_numeric_stats_by_doc_ids_refactored for field '{}' with {} doc_ids",
+) -> PolarsResult<(NumericStats, QueryStats)> {
+    let mut stats = QueryStats::new(
+        "get_numeric_stats_by_doc_ids",
         field_name,
-        doc_ids.len()
+        Some(doc_ids.len()),
     );
-    let start_time = Instant::now();
-    let args = ScanArgsParquet {
-        low_memory,
-        ..Default::default()
-    };
+    let overall_start = Instant::now();
+
+    // Setup phase
+    let args = time_section!(stats, setup, {
+        println!(
+            "Querying get_numeric_stats_by_doc_ids for field '{}' with {} doc_ids",
+            field_name,
+            doc_ids.len()
+        );
+        ScanArgsParquet {
+            low_memory,
+            ..Default::default()
+        }
+    });
+
     let lf = LazyFrame::scan_parquet(file_path, args)?;
     let column_name = field_name_to_column(field_name);
 
-    // 1. Create filter DataFrame (Fixed: Use SortOptions)
-    let filter_df = df! (
-        "doc_id" => doc_ids,
-    )?
-    .lazy()
-    .sort(["doc_id"], SortMultipleOptions::default()); // Use SortOptions
+    // Filter creation phase
+    let filter_df = time_section!(stats, filter_creation, {
+        df! (
+            "doc_id" => doc_ids,
+        )?
+        .lazy()
+        .sort(["doc_id"], SortMultipleOptions::default())
+    });
 
-    // 2. Perform Inner Join
-    let filtered_lf = lf.join(
-        filter_df,
-        [col("doc_id")],
-        [col("doc_id")],
-        JoinArgs::new(JoinType::Inner),
-    );
+    // Join operation phase
+    let filtered_lf = time_section!(stats, join_operation, {
+        lf.join(
+            filter_df,
+            [col("doc_id")],
+            [col("doc_id")],
+            JoinArgs::new(JoinType::Inner),
+        )
+    });
 
-    // 3. Define aggregation expressions
+    // Define aggregation expressions and collect
     let numeric_expr_int = col(&column_name);
     let numeric_expr_float = numeric_expr_int.clone().cast(DataType::Float64);
+
     let result_lf = filtered_lf.select([
         numeric_expr_int
             .clone()
@@ -557,37 +573,38 @@ fn get_numeric_stats_by_doc_ids_refactored(
         numeric_expr_float.mean().alias("avg"),
     ]);
 
-    // 4. Collect the result
-    let df = result_lf.collect()?;
-    println!(
-        "Collected DataFrame for get_numeric_stats_by_doc_ids_refactored, height: {}",
-        df.height()
-    );
+    // Collect phase
+    let df = time_section!(stats, collect, { result_lf.collect()? });
+    stats.set_result_rows(df.height());
 
-    // 5. Extract stats safely
-    let stats = if df.height() == 0 {
-        NumericStats {
-            min: None,
-            max: None,
-            avg: None,
+    // Processing phase
+    let numeric_stats = time_section!(stats, processing, {
+        if df.height() == 0 {
+            NumericStats {
+                min: None,
+                max: None,
+                avg: None,
+            }
+        } else {
+            let min_val = df.column("min")?.f64()?.get(0);
+            let max_val = df.column("max")?.f64()?.get(0);
+            let avg_val = df.column("avg")?.f64()?.get(0);
+            NumericStats {
+                min: min_val,
+                max: max_val,
+                avg: avg_val,
+            }
         }
-    } else {
-        let min_val = df.column("min")?.f64()?.get(0);
-        let max_val = df.column("max")?.f64()?.get(0);
-        let avg_val = df.column("avg")?.f64()?.get(0);
-        NumericStats {
-            min: min_val,
-            max: max_val,
-            avg: avg_val,
-        }
-    };
+    });
 
-    log::info!(
-        "get_numeric_stats_by_doc_ids_refactored for '{}' took {:?}",
-        field_name,
-        start_time.elapsed()
-    );
-    Ok(stats)
+    // Update total time
+    stats.timing.total = overall_start.elapsed();
+    stats.update_memory();
+
+    // Print summary
+    stats.print_summary();
+
+    Ok((numeric_stats, stats))
 }
 
 // --- REFACTORED get_numeric_stats (Unchanged from previous fix) ---
@@ -595,19 +612,26 @@ fn get_numeric_stats_refactored(
     field_name: &str,
     file_path: &str,
     low_memory: bool,
-) -> PolarsResult<NumericStats> {
+) -> PolarsResult<(NumericStats, QueryStats)> {
     println!(
         "Querying get_numeric_stats_refactored for field '{}'",
         field_name
     );
-    let start_time = Instant::now();
-    let args = ScanArgsParquet {
-        low_memory,
-        ..Default::default()
-    };
+    // Initialize QueryStats instrumentation
+    let mut stats = QueryStats::new("get_numeric_stats_refactored", field_name, None);
+    let overall_start = Instant::now();
+
+    // Setup phase: create scan arguments with timing
+    let args = time_section!(stats, setup, {
+        ScanArgsParquet {
+            low_memory,
+            ..Default::default()
+        }
+    });
     let lf = LazyFrame::scan_parquet(file_path, args)?;
     let column_name = field_name_to_column(field_name);
 
+    // Construct the aggregation expressions for numeric stats
     let numeric_expr_int = col(&column_name);
     let numeric_expr_float = numeric_expr_int.clone().cast(DataType::Float64);
     let result_lf = lf.select([
@@ -624,35 +648,44 @@ fn get_numeric_stats_refactored(
         numeric_expr_float.mean().alias("avg"),
     ]);
 
-    let df = result_lf.collect()?;
+    // Collect phase: materialize the DataFrame with timing
+    let df = time_section!(stats, collect, { result_lf.collect()? });
     println!(
         "Collected DataFrame for get_numeric_stats_refactored, height: {}",
         df.height()
     );
 
-    let stats = if df.height() == 0 {
-        NumericStats {
-            min: None,
-            max: None,
-            avg: None,
+    // Processing phase: compute the numeric stats from the DataFrame
+    let numeric_stats = time_section!(stats, processing, {
+        if df.height() == 0 {
+            NumericStats {
+                min: None,
+                max: None,
+                avg: None,
+            }
+        } else {
+            let min_val = df.column("min")?.f64()?.get(0);
+            let max_val = df.column("max")?.f64()?.get(0);
+            let avg_val = df.column("avg")?.f64()?.get(0);
+            NumericStats {
+                min: min_val,
+                max: max_val,
+                avg: avg_val,
+            }
         }
-    } else {
-        let min_val = df.column("min")?.f64()?.get(0);
-        let max_val = df.column("max")?.f64()?.get(0);
-        let avg_val = df.column("avg")?.f64()?.get(0);
-        NumericStats {
-            min: min_val,
-            max: max_val,
-            avg: avg_val,
-        }
-    };
+    });
+
+    // Update overall timing and memory usage
+    stats.timing.total = overall_start.elapsed();
+    stats.update_memory();
+    stats.print_summary();
 
     log::info!(
         "get_numeric_stats_refactored for '{}' took {:?}",
         field_name,
-        start_time.elapsed()
+        overall_start.elapsed()
     );
-    Ok(stats)
+    Ok((numeric_stats, stats))
 }
 
 // --- Main Function (Unchanged from previous fix) ---
@@ -691,11 +724,12 @@ fn main() -> PolarsResult<()> {
     log::info!("Parquet writing complete.");
 
     log::info!("Pausing for 5 seconds before querying...");
-    std::thread::sleep(StdDuration::from_secs(5));
+    std::thread::sleep(StdDuration::from_secs(10));
 
     log::info!("Starting queries (low_memory = {})...", low_memory);
 
     let query_doc_ids: Vec<i64> = (0..100).map(|i| i * (num_records / 100) as i64).collect();
+    let mut all_query_stats = Vec::new();
 
     match get_field_values_by_doc_ids_refactored(
         "level",
@@ -703,32 +737,48 @@ fn main() -> PolarsResult<()> {
         parquet_file_path,
         low_memory,
     ) {
-        Ok(result) => log::info!(
-            "Result for get_field_values_by_doc_ids_refactored('level', specific_ids): {} unique levels found.",
-            result.value_map.len()
-        ),
+        Ok((result, stats)) => {
+            log::info!(
+                "Result for get_field_values_by_doc_ids('level', specific_ids): {} unique levels found.",
+                result.value_map.len()
+            );
+            all_query_stats.push(stats);
+        }
         Err(e) => log::error!("Error querying field values by doc_ids (level): {}", e),
     }
+
+    std::thread::sleep(StdDuration::from_secs(10));
+
     match get_field_values_by_doc_ids_refactored(
         "source_region",
         &query_doc_ids,
         parquet_file_path,
         low_memory,
     ) {
-        Ok(result) => log::info!(
-            "Result for get_field_values_by_doc_ids_refactored('source_region', specific_ids): {} unique regions found.",
-            result.value_map.len()
-        ),
+        Ok((result, stats)) => {
+            log::info!(
+                "Result for get_field_values_by_doc_ids('source_region', specific_ids): {} unique levels found.",
+                result.value_map.len()
+            );
+            all_query_stats.push(stats);
+        }
         Err(e) => log::error!("Error querying field values by doc_ids (region): {}", e),
     }
 
+    std::thread::sleep(StdDuration::from_secs(10));
+
     match get_field_values_refactored("source_host", parquet_file_path, low_memory) {
-        Ok(result) => log::info!(
-            "Result for get_field_values_refactored('source_host'): {} unique hosts found.",
-            result.value_map.len()
-        ),
+        Ok((result, stats)) => {
+            log::info!(
+                "Result for get_field_values_refactored('source_host'): {} unique hosts found.",
+                result.value_map.len()
+            );
+            all_query_stats.push(stats);
+        }
         Err(e) => log::error!("Error querying field values (host): {}", e),
     }
+
+    std::thread::sleep(StdDuration::from_secs(10));
 
     match get_numeric_stats_by_doc_ids_refactored(
         "payload_size",
@@ -736,30 +786,47 @@ fn main() -> PolarsResult<()> {
         parquet_file_path,
         low_memory,
     ) {
-        Ok(stats) => log::info!(
-            "Result for get_numeric_stats_by_doc_ids_refactored('payload_size', specific_ids): {:?}",
-            stats
-        ),
+        Ok((result, stats)) => {
+            log::info!(
+                "Result for get_field_values_by_doc_ids('source_region', specific_ids): {:?} unique regions found.",
+                result
+            );
+            all_query_stats.push(stats);
+        }
         Err(e) => log::error!("Error querying numeric stats by doc_ids (payload): {}", e),
     }
+
+    std::thread::sleep(StdDuration::from_secs(10));
+
     match get_numeric_stats_by_doc_ids_refactored(
         "user_metrics_login_time_ms",
         &query_doc_ids,
         parquet_file_path,
         low_memory,
     ) {
-        Ok(stats) => log::info!(
-            "Result for get_numeric_stats_by_doc_ids_refactored('user_metrics_login_time_ms', specific_ids): {:?}",
-            stats
+        Ok((result, stats)) => {
+            log::info!(
+                "Result for get_field_values_by_doc_ids('source_region', specific_ids): {:?} unique regions found.",
+                result
+            );
+            all_query_stats.push(stats);
+        }
+        Err(e) => log::error!(
+            "Error querying numeric stats by doc_ids (login_time): {}",
+            e
         ),
-        Err(e) => log::error!("Error querying numeric stats by doc_ids (login_time): {}", e),
     }
 
+    std::thread::sleep(StdDuration::from_secs(10));
+
     match get_numeric_stats_refactored("user_metrics_clicks", parquet_file_path, low_memory) {
-        Ok(stats) => log::info!(
-            "Result for get_numeric_stats_refactored('user_metrics_clicks'): {:?}",
-            stats
-        ),
+        Ok((result, stats)) => {
+            log::info!(
+                "Result for get_numeric_stats_refactored('user_metrics_clicks'): {:?}",
+                result
+            );
+            all_query_stats.push(stats);
+        }
         Err(e) => log::error!("Error querying numeric stats (clicks): {}", e),
     }
 
