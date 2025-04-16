@@ -1,51 +1,54 @@
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use polars::datatypes::DataType;
-use polars::prelude::*;
+use chrono::{DateTime, NaiveDateTime, Utc};
+// Removed unused ListUtf8ChunkedBuilder, added ListStringChunkedBuilder just in case, but not used in final approach
+use polars::chunked_array::builder::{
+    ListBooleanChunkedBuilder, ListBuilderTrait, ListPrimitiveChunkedBuilder,
+};
+// Import CategoricalOrdering and SortOptions
+use polars::datatypes::{CategoricalOrdering, DataType, Field, Int64Type, TimeUnit};
+use polars::prelude::*; // Includes StringChunkedBuilder, SortOptions etc.
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
-use std::thread::sleep;
-// Remove unused import
-// use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::Arc; // Needed for Categorical RevMapping potentially, and Field
+use std::time::{Duration as StdDuration, Instant}; // Renamed to avoid conflict
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+// --- Struct Definitions (Unchanged) ---
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct LogSource {
     ip: String,
     host: String,
     region: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct UserMetrics {
     login_time_ms: i64,
     clicks: i64,
     active: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct User {
     id: String,
     session_id: String,
     metrics: UserMetrics,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Answer {
     #[serde(rename = "nxDomain")]
     nx_domain: bool,
     response_time_ms: i64,
 }
 
-// Main log record matching the JSON structure
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct LogRecord {
     doc_id: i64,
-    timestamp: String, // Keeping as String; Polars can parse
+    timestamp: String,
     level: String,
     message: String,
     source: LogSource,
@@ -56,8 +59,9 @@ struct LogRecord {
     processed: bool,
 }
 
+// --- Data Generation (Unchanged) ---
 fn generate_random_log_record(i: usize, base_time: DateTime<Utc>) -> LogRecord {
-    let mut rng = rand::thread_rng(); // Use thread_rng per call for simplicity in parallel map
+    let mut rng = rand::thread_rng();
     let levels = ["info", "warn", "error", "debug", "trace"];
     let regions = [
         "us-east-1",
@@ -69,7 +73,8 @@ fn generate_random_log_record(i: usize, base_time: DateTime<Utc>) -> LogRecord {
     let hosts = (1..=20)
         .map(|n| format!("server-{}.region.local", n))
         .collect::<Vec<_>>();
-    let timestamp = base_time + ChronoDuration::milliseconds(rng.gen_range(-30000..30000));
+    let offset_ms = rng.gen_range(-30000..30000);
+    let timestamp = base_time + chrono::Duration::milliseconds(offset_ms);
     let answers_len = rng.gen_range(0..=3);
     let answers = (0..answers_len)
         .map(|_| Answer {
@@ -105,10 +110,10 @@ fn generate_random_log_record(i: usize, base_time: DateTime<Utc>) -> LogRecord {
     }
 }
 
-// Create DataFrame from a batch of records
-fn create_dataframe_from_records(records: &[LogRecord]) -> PolarsResult<DataFrame> {
+// --- OPTIMIZED DataFrame Creation (Fixed) ---
+fn create_dataframe_from_records_optimized(records: &[LogRecord]) -> PolarsResult<DataFrame> {
+    // --- Primitive and Simple String Columns ---
     let doc_ids: Vec<i64> = records.iter().map(|r| r.doc_id).collect();
-    let timestamps: Vec<&str> = records.iter().map(|r| r.timestamp.as_str()).collect();
     let levels: Vec<&str> = records.iter().map(|r| r.level.as_str()).collect();
     let messages: Vec<&str> = records.iter().map(|r| r.message.as_str()).collect();
     let source_ips: Vec<&str> = records.iter().map(|r| r.source.ip.as_str()).collect();
@@ -123,20 +128,56 @@ fn create_dataframe_from_records(records: &[LogRecord]) -> PolarsResult<DataFram
     let user_metrics_clicks: Vec<i64> = records.iter().map(|r| r.user.metrics.clicks).collect();
     let user_metrics_active: Vec<bool> = records.iter().map(|r| r.user.metrics.active).collect();
     let payload_sizes: Vec<i64> = records.iter().map(|r| r.payload_size).collect();
-    // For tags and answers, you can collect them as JSON strings
-    let tags: Vec<String> = records
-        .iter()
-        .map(|r| serde_json::to_string(&r.tags).unwrap_or_default())
-        .collect();
-    let answers: Vec<String> = records
-        .iter()
-        .map(|r| serde_json::to_string(&r.answers).unwrap_or_default())
-        .collect();
     let processed: Vec<bool> = records.iter().map(|r| r.processed).collect();
 
+    // --- Timestamp Column (Parse to Native Datetime) ---
+    let timestamps_naive: Vec<Option<NaiveDateTime>> = records
+        .iter()
+        .map(|r| {
+            DateTime::parse_from_rfc3339(&r.timestamp)
+                .ok()
+                .map(|dt| dt.naive_utc())
+        })
+        .collect();
+    let timestamps_series = Series::new("timestamp".into(), timestamps_naive)
+        .cast(&DataType::Datetime(TimeUnit::Microseconds, None))?;
+
+    // --- Tags Column (List<String>) ---
+    let tags_series_inner: Vec<Series> = records
+        .iter()
+        .map(|r| Series::new("".into(), &r.tags)) // Inner Series for each record's tags
+        .collect();
+    let tags_series = Series::new("tags".into(), &tags_series_inner); // Create List<String> Series
+
+    // --- Answers Column (List<Struct>) ---
+    // Revised approach: Create a Vec<Series>, where each Series is a StructChunked for one record
+    let answers_series_inner: Vec<Series> = records
+        .iter()
+        .map(|r| {
+            // Create inner columns for *this* record's answers
+            let nx_domains: Vec<bool> = r.answers.iter().map(|a| a.nx_domain).collect();
+            let response_times: Vec<i64> = r.answers.iter().map(|a| a.response_time_ms).collect();
+
+            let nx_domain_ca = BooleanChunked::from_slice("nx_domain".into(), &nx_domains);
+            let response_time_ca =
+                Int64Chunked::from_slice("response_time_ms".into(), &response_times);
+
+            // Create a Struct Series for this record
+            StructChunked::from_series(
+                "".into(), // Name for inner struct series doesn't matter here
+                &[nx_domain_ca.into_series(), response_time_ca.into_series()],
+            )
+            .map(|sc| sc.into_series()) // Convert Result<StructChunked> to Result<Series>
+        })
+        .collect::<PolarsResult<Vec<Series>>>()?; // Collect results, handling potential errors
+
+    // Create the final List<Struct> series from the Vec<Series>
+    let answers_series = Series::new("answers".into(), &answers_series_inner);
+
+    // --- Assemble DataFrame ---
     DataFrame::new(vec![
         Series::new("doc_id".into(), doc_ids),
-        Series::new("timestamp".into(), timestamps),
+        timestamps_series,
         Series::new("level".into(), levels),
         Series::new("message".into(), messages),
         Series::new("source_ip".into(), source_ips),
@@ -148,13 +189,14 @@ fn create_dataframe_from_records(records: &[LogRecord]) -> PolarsResult<DataFram
         Series::new("user_metrics_clicks".into(), user_metrics_clicks),
         Series::new("user_metrics_active".into(), user_metrics_active),
         Series::new("payload_size".into(), payload_sizes),
-        Series::new("tags".into(), tags),
-        Series::new("answers".into(), answers),
+        tags_series,
+        answers_series, // Use the List<Struct> series created above
         Series::new("processed".into(), processed),
     ])
 }
 
-fn write_records_to_single_parquet(
+// --- OPTIMIZED Parquet Writing (Fixed) ---
+fn write_records_to_single_parquet_optimized(
     records: Vec<LogRecord>,
     file_path: &str,
     compression: ParquetCompression,
@@ -165,122 +207,77 @@ fn write_records_to_single_parquet(
     }
     let start_time = Instant::now();
     log::info!(
-        "Writing {} records to single Parquet file {}...",
+        "Writing {} records to single Parquet file {} (Optimized)...",
         records.len(),
         file_path
     );
 
-    // Create a single DataFrame from all records in memory.
-    let mut df = create_dataframe_from_records(&records)?;
-    df = df.sort(["doc_id"], Default::default())?;
+    // 1. Create DataFrame using the optimized function
+    let mut df = create_dataframe_from_records_optimized(&records)?;
+    log::info!(
+        "Created DataFrame with optimized types in {:?}",
+        start_time.elapsed()
+    );
+    let create_df_time = Instant::now();
 
+    // 2. Apply Categorical Casting (Fixed: Added CategoricalOrdering)
+    let categorical_dtype = DataType::Categorical(None, CategoricalOrdering::Physical);
+    df.try_apply("level", |s| s.cast(&categorical_dtype))?;
+    df.try_apply("source_region", |s| s.cast(&categorical_dtype))?;
+    df.try_apply("source_host", |s| s.cast(&categorical_dtype))?;
+    log::info!(
+        "Applied Categorical casts in {:?}",
+        create_df_time.elapsed()
+    );
+    let cast_time = Instant::now();
+
+    // 3. Sort DataFrame (Fixed: Use SortOptions::default() for single column)
+    df = df.sort(["doc_id"], SortMultipleOptions::default())?;
+    log::info!("Sorted DataFrame by doc_id in {:?}", cast_time.elapsed());
+    let sort_time = Instant::now();
+
+    // 4. Write to Parquet
     let file = File::create(file_path)?;
     let buf_writer = BufWriter::new(file);
 
-    // Configure the Parquet writer.
-    let mut parquet_writer = ParquetWriter::new(buf_writer)
+    ParquetWriter::new(buf_writer)
         .with_compression(compression)
-        .with_statistics(StatisticsOptions::full());
+        .with_statistics(StatisticsOptions::full())
+        .with_row_group_size(row_group_size)
+        .finish(&mut df)?;
 
-    if let Some(rg_size) = row_group_size {
-        parquet_writer = parquet_writer.with_row_group_size(Some(rg_size));
-    }
-
-    parquet_writer.finish(&mut df)?;
     let duration = start_time.elapsed();
+    // Note: df height might be slightly different if creation failed partially, but generally ok
     log::info!(
-        "Successfully wrote {} records to {} in {:?}",
-        records.len(),
+        "Successfully wrote {} records to {} in {:?} (Write took {:?})",
+        records.len(), // Use original record count for logging consistency
         file_path,
-        duration
+        duration,
+        sort_time.elapsed()
     );
     Ok(())
 }
 
-// fn write_records_to_parquet_chunked(
-//     records: Vec<LogRecord>,
-//     file_path: &str,
-//     chunk_size: usize,
-//     compression: ParquetCompression,
-//     row_group_size: Option<usize>,
-// ) -> PolarsResult<()> {
-//     if records.is_empty() {
-//         return Ok(());
-//     }
-//     let start_time = Instant::now();
-//     log::info!("Starting Parquet write to {}...", file_path);
-
-//     let file = File::create(file_path)?;
-//     let buf_writer = BufWriter::new(file);
-
-//     println!("creating data frame from records");
-
-//     // Create DataFrame from the first chunk
-//     let first_chunk_slice = &records[0..chunk_size.min(records.len())];
-//     let mut initial_df = create_dataframe_from_records(first_chunk_slice)?;
-
-//     println!("done creating data frame from records");
-
-//     let mut parquet_writer = ParquetWriter::new(buf_writer)
-//         .with_compression(compression)
-//         .with_statistics(StatisticsOptions::full());
-
-//     if let Some(rg_size) = row_group_size {
-//         parquet_writer = parquet_writer.with_row_group_size(Some(rg_size));
-//     }
-
-//     let mut total_written = 0;
-//     // Write the first chunk
-//     println!("Writing first chunk (size {})...", initial_df.height());
-//     parquet_writer.finish(&mut initial_df)?;
-//     total_written += initial_df.height();
-
-//     // For remaining chunks, create new writers for each chunk
-//     for chunk in records.chunks(chunk_size).skip(1) {
-//         let file = File::options().append(true).open(file_path)?;
-//         let buf_writer = BufWriter::new(file);
-//         let mut parquet_writer = ParquetWriter::new(buf_writer)
-//             .with_compression(compression)
-//             .with_statistics(StatisticsOptions::full());
-
-//         if let Some(rg_size) = row_group_size {
-//             parquet_writer = parquet_writer.with_row_group_size(Some(rg_size));
-//         }
-
-//         println!("Writing chunk (size {})...", chunk.len());
-//         let mut df_chunk = create_dataframe_from_records(chunk)?;
-//         parquet_writer.finish(&mut df_chunk)?;
-//         total_written += chunk.len();
-//     }
-
-//     let duration = start_time.elapsed();
-//     log::info!(
-//         "Successfully wrote {} records to {} in {:?}",
-//         total_written,
-//         file_path,
-//         duration
-//     );
-//     Ok(())
-// }
-
-// Helper function for field names - replace . with _
+// --- Helper for Field Names (Unchanged) ---
 fn field_name_to_column(field_name: &str) -> String {
-    field_name.replace(".", "_")
+    field_name.replace('.', "_")
 }
 
+// --- Result Struct (Unchanged) ---
 #[derive(Debug)]
 struct FieldValueResult {
     value_map: HashMap<String, Vec<i64>>,
 }
 
-fn get_field_values_by_doc_ids(
+// --- REFACTORED get_field_values_by_doc_ids (Fixed) ---
+fn get_field_values_by_doc_ids_refactored(
     field_name: &str,
     doc_ids: &[i64],
     file_path: &str,
     low_memory: bool,
 ) -> PolarsResult<FieldValueResult> {
     println!(
-        "Querying get_field_values_by_doc_ids for field '{}' with {} doc_ids",
+        "Querying get_field_values_by_doc_ids_refactored for field '{}' with {} doc_ids",
         field_name,
         doc_ids.len()
     );
@@ -290,130 +287,217 @@ fn get_field_values_by_doc_ids(
         ..Default::default()
     };
     let lf = LazyFrame::scan_parquet(file_path, args)?;
-
-    // Convert field name to column name format (replace '.' with '_')
     let column_name = field_name_to_column(field_name);
-    // Instead of wrapping a Series, create a constant vector:
-    let doc_ids_vec = doc_ids.to_vec();
 
-    // Use the constant literal for filtering
-    let result_lf = lf
-        .filter(col("doc_id").is_in(lit(Series::new("doc_ids_const".into(), &doc_ids_vec))))
-        .group_by([col(&column_name)])
-        .agg([col("doc_id").list().0.alias("doc_ids_list")])
-        .select([col(&column_name), col("doc_ids_list")]);
+    // 1. Create filter DataFrame (Fixed: Use SortOptions)
+    let filter_df = df! (
+        "doc_id" => doc_ids,
+    )?
+    .lazy()
+    .sort(["doc_id"], SortMultipleOptions::default()); // Use SortOptions
 
-    let df = result_lf.collect()?;
-    println!(
-        "Collected DataFrame for get_field_values_by_doc_ids, height: {}",
-        df.height()
+    // 2. Perform Inner Join
+    let filtered_lf = lf.join(
+        filter_df,
+        [col("doc_id")],
+        [col("doc_id")],
+        JoinArgs::new(JoinType::Inner),
     );
 
-    let field_col = df.column(&column_name)?;
-    let ids_col = df.column("doc_ids_list")?;
-    let mut value_map = HashMap::new();
+    // 3. Select necessary columns
+    let result_lf = filtered_lf.select([col(&column_name), col("doc_id")]);
 
-    for i in 0..df.height() {
-        if let Ok(key_value) = field_col.get(i) {
-            let key_str = key_value.to_string();
-            let clean_key = key_str.trim_matches('"').to_string();
+    // 4. Collect DataFrame
+    let df = result_lf.collect()?;
+    let collect_time = start_time.elapsed();
+    println!(
+        "Collected DataFrame for get_field_values_by_doc_ids_refactored, height: {}, took {:?}",
+        df.height(),
+        collect_time
+    );
 
-            match ids_col.get(i) {
-                Ok(AnyValue::List(list_series)) => {
-                    if let Ok(i64_ca) = list_series.i64() {
-                        let ids_vec: Vec<i64> = i64_ca.into_iter().flatten().collect();
-                        value_map.insert(clean_key, ids_vec);
+    let group_time_start = Instant::now();
+
+    // 5. Perform grouping in Rust (Fixed: Use DataType::String, corrected Categorical match)
+    let mut value_map: HashMap<String, Vec<i64>> = HashMap::new();
+    if df.height() > 0 {
+        let field_col = df.column(&column_name)?;
+        let ids_col = df.column("doc_id")?;
+        let ids_ca = ids_col.i64()?;
+
+        match field_col.dtype() {
+            // Match requires full pattern including ordering
+            DataType::Categorical(_, _) => {
+                // Match any Categorical
+                let field_ca = field_col.categorical()?;
+                field_ca
+                    .iter_str()
+                    .zip(ids_ca.into_iter())
+                    .for_each(|(key_opt, id_opt)| {
+                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                            value_map.entry(key.to_string()).or_default().push(id);
+                        }
+                    });
+            }
+            DataType::String => {
+                // Use String instead of Utf8
+                let field_ca = field_col.str()?; // Use .str() accessor
+                field_ca
+                    .into_iter()
+                    .zip(ids_ca.into_iter())
+                    .for_each(|(key_opt, id_opt)| {
+                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                            value_map.entry(key.to_string()).or_default().push(id);
+                        }
+                    });
+            }
+            DataType::Boolean => {
+                let field_ca = field_col.bool()?;
+                field_ca
+                    .into_iter()
+                    .zip(ids_ca.into_iter())
+                    .for_each(|(key_opt, id_opt)| {
+                        if let (Some(key_bool), Some(id)) = (key_opt, id_opt) {
+                            let key_str = key_bool.to_string();
+                            value_map.entry(key_str).or_default().push(id);
+                        }
+                    });
+            }
+            other_type => {
+                log::warn!(
+                    "Grouping column '{}' has unexpected type: {:?}. Trying AnyValue conversion.",
+                    column_name,
+                    other_type
+                );
+                for i in 0..df.height() {
+                    if let (Ok(key_any), Ok(id_any)) = (field_col.get(i), ids_col.get(i)) {
+                        if let AnyValue::Int64(id) = id_any {
+                            let key_str = key_any.to_string().trim_matches('"').to_string();
+                            value_map.entry(key_str).or_default().push(id);
+                        }
                     }
-                }
-                Ok(other) => {
-                    log::warn!("Expected a list, but got: {:?}", other);
-                }
-                Err(e) => {
-                    log::warn!("Error retrieving value: {:?}", e);
                 }
             }
         }
     }
+    let group_time = group_time_start.elapsed();
 
     log::info!(
-        "get_field_values_by_doc_ids for '{}' took {:?}",
+        "get_field_values_by_doc_ids_refactored for '{}' took {:?} (Collect: {:?}, Group: {:?})",
         field_name,
-        start_time.elapsed()
+        start_time.elapsed(),
+        collect_time,
+        group_time
     );
     Ok(FieldValueResult { value_map })
 }
 
-fn get_field_values(
+// --- REFACTORED get_field_values (Fixed) ---
+fn get_field_values_refactored(
     field_name: &str,
     file_path: &str,
     low_memory: bool,
 ) -> PolarsResult<FieldValueResult> {
-    println!("Querying get_field_values for field '{}'", field_name);
+    println!(
+        "Querying get_field_values_refactored for field '{}'",
+        field_name
+    );
     let start_time = Instant::now();
     let args = ScanArgsParquet {
         low_memory,
         ..Default::default()
     };
     let lf = LazyFrame::scan_parquet(file_path, args)?;
-
-    // Convert field name to column name format
     let column_name = field_name_to_column(field_name);
 
-    let result_lf = lf
-        .select([col(&column_name), col("doc_id")])
-        .group_by([col(&column_name)])
-        .agg([col("doc_id").list().0])
-        .select([col(&column_name), col("doc_id").alias("doc_ids_list")]);
+    // 1. Select necessary columns
+    let result_lf = lf.select([col(&column_name), col("doc_id")]);
 
+    // 2. Collect DataFrame
     let df = result_lf.collect()?;
+    let collect_time = start_time.elapsed();
     println!(
-        "Collected DataFrame for get_field_values, height: {}",
-        df.height()
+        "Collected DataFrame for get_field_values_refactored, height: {}, took {:?}",
+        df.height(),
+        collect_time
     );
 
-    // Process similar to get_field_values_by_doc_ids
-    let field_col = df.column(&column_name)?;
-    let ids_col = df.column("doc_ids_list")?;
-    let mut value_map = HashMap::new();
+    let group_time_start = Instant::now();
 
-    for i in 0..df.height() {
-        // Safe unwrapping of field value
-        if let Ok(key_value) = field_col.get(i) {
-            let key_str = key_value.to_string();
-            let clean_key = key_str.trim_matches('"').to_string();
+    // 3. Perform grouping in Rust (Fixed: Use DataType::String, corrected Categorical match)
+    let mut value_map: HashMap<String, Vec<i64>> = HashMap::new();
+    if df.height() > 0 {
+        let field_col = df.column(&column_name)?;
+        let ids_col = df.column("doc_id")?;
+        let ids_ca = ids_col.i64()?;
 
-            // Extract the list values safely
-            match ids_col.get(i) {
-                Ok(AnyValue::List(list_series)) => {
-                    // Extract i64 values from the list, flattening out any None values.
-                    if let Ok(i64_ca) = list_series.i64() {
-                        let ids_vec: Vec<i64> = i64_ca.into_iter().flatten().collect();
-                        value_map.insert(clean_key, ids_vec);
-                    } else {
-                        log::warn!(
-                            "Could not convert list series to i64 for key '{}'",
-                            clean_key
-                        );
+        match field_col.dtype() {
+            DataType::Categorical(_, _) => {
+                // Match any Categorical
+                let field_ca = field_col.categorical()?;
+                field_ca
+                    .iter_str()
+                    .zip(ids_ca.into_iter())
+                    .for_each(|(key_opt, id_opt)| {
+                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                            value_map.entry(key.to_string()).or_default().push(id);
+                        }
+                    });
+            }
+            DataType::String => {
+                // Use String instead of Utf8
+                let field_ca = field_col.str()?; // Use .str() accessor
+                field_ca
+                    .into_iter()
+                    .zip(ids_ca.into_iter())
+                    .for_each(|(key_opt, id_opt)| {
+                        if let (Some(key), Some(id)) = (key_opt, id_opt) {
+                            value_map.entry(key.to_string()).or_default().push(id);
+                        }
+                    });
+            }
+            DataType::Boolean => {
+                let field_ca = field_col.bool()?;
+                field_ca
+                    .into_iter()
+                    .zip(ids_ca.into_iter())
+                    .for_each(|(key_opt, id_opt)| {
+                        if let (Some(key_bool), Some(id)) = (key_opt, id_opt) {
+                            let key_str = key_bool.to_string();
+                            value_map.entry(key_str).or_default().push(id);
+                        }
+                    });
+            }
+            other_type => {
+                log::warn!(
+                    "Grouping column '{}' has unexpected type: {:?}. Trying AnyValue conversion.",
+                    column_name,
+                    other_type
+                );
+                for i in 0..df.height() {
+                    if let (Ok(key_any), Ok(id_any)) = (field_col.get(i), ids_col.get(i)) {
+                        if let AnyValue::Int64(id) = id_any {
+                            let key_str = key_any.to_string().trim_matches('"').to_string();
+                            value_map.entry(key_str).or_default().push(id);
+                        }
                     }
-                }
-                Ok(other) => {
-                    log::warn!("Expected a list, but got: {:?}", other);
-                }
-                Err(e) => {
-                    log::warn!("Error retrieving value: {:?}", e);
                 }
             }
         }
     }
+    let group_time = group_time_start.elapsed();
 
     log::info!(
-        "get_field_values for '{}' took {:?}",
+        "get_field_values_refactored for '{}' took {:?} (Collect: {:?}, Group: {:?})",
         field_name,
-        start_time.elapsed()
+        start_time.elapsed(),
+        collect_time,
+        group_time
     );
     Ok(FieldValueResult { value_map })
 }
 
+// --- Numeric Stats Struct (Unchanged) ---
 #[derive(Debug, Clone, PartialEq)]
 pub struct NumericStats {
     pub min: Option<f64>,
@@ -421,14 +505,15 @@ pub struct NumericStats {
     pub avg: Option<f64>,
 }
 
-fn get_numeric_stats_by_doc_ids(
+// --- REFACTORED get_numeric_stats_by_doc_ids (Fixed) ---
+fn get_numeric_stats_by_doc_ids_refactored(
     field_name: &str,
     doc_ids: &[i64],
     file_path: &str,
     low_memory: bool,
 ) -> PolarsResult<NumericStats> {
     println!(
-        "Querying get_numeric_stats_by_doc_ids for field '{}' with {} doc_ids",
+        "Querying get_numeric_stats_by_doc_ids_refactored for field '{}' with {} doc_ids",
         field_name,
         doc_ids.len()
     );
@@ -438,140 +523,148 @@ fn get_numeric_stats_by_doc_ids(
         ..Default::default()
     };
     let lf = LazyFrame::scan_parquet(file_path, args)?;
-
-    // Convert field name to column name format
     let column_name = field_name_to_column(field_name);
-    let doc_ids_series = Series::new("doc_id_filter".into(), doc_ids);
-    let numeric_expr = col(&column_name).cast(DataType::Float64);
 
-    let result_lf = lf.filter(col("doc_id").is_in(lit(doc_ids_series))).select([
-        numeric_expr.clone().min().alias("min"),
-        numeric_expr.clone().max().alias("max"),
-        numeric_expr.mean().alias("avg"),
+    // 1. Create filter DataFrame (Fixed: Use SortOptions)
+    let filter_df = df! (
+        "doc_id" => doc_ids,
+    )?
+    .lazy()
+    .sort(["doc_id"], SortMultipleOptions::default()); // Use SortOptions
+
+    // 2. Perform Inner Join
+    let filtered_lf = lf.join(
+        filter_df,
+        [col("doc_id")],
+        [col("doc_id")],
+        JoinArgs::new(JoinType::Inner),
+    );
+
+    // 3. Define aggregation expressions
+    let numeric_expr_int = col(&column_name);
+    let numeric_expr_float = numeric_expr_int.clone().cast(DataType::Float64);
+    let result_lf = filtered_lf.select([
+        numeric_expr_int
+            .clone()
+            .min()
+            .cast(DataType::Float64)
+            .alias("min"),
+        numeric_expr_int
+            .clone()
+            .max()
+            .cast(DataType::Float64)
+            .alias("max"),
+        numeric_expr_float.mean().alias("avg"),
     ]);
 
+    // 4. Collect the result
     let df = result_lf.collect()?;
     println!(
-        "Collected DataFrame for get_numeric_stats_by_doc_ids, height: {}",
+        "Collected DataFrame for get_numeric_stats_by_doc_ids_refactored, height: {}",
         df.height()
     );
 
-    if df.height() == 0 {
-        return Ok(NumericStats {
+    // 5. Extract stats safely
+    let stats = if df.height() == 0 {
+        NumericStats {
             min: None,
             max: None,
             avg: None,
-        });
-    }
-
-    // Extract values safely
-    let min_val = df
-        .column("min")?
-        .get(0)
-        .and_then(|av| av.try_extract::<f64>())
-        .ok();
-    let max_val = df
-        .column("max")?
-        .get(0)
-        .and_then(|av| av.try_extract::<f64>())
-        .ok();
-    let avg_val = df
-        .column("avg")?
-        .get(0)
-        .and_then(|av| av.try_extract::<f64>())
-        .ok();
-
-    let stats = NumericStats {
-        min: min_val,
-        max: max_val,
-        avg: avg_val,
+        }
+    } else {
+        let min_val = df.column("min")?.f64()?.get(0);
+        let max_val = df.column("max")?.f64()?.get(0);
+        let avg_val = df.column("avg")?.f64()?.get(0);
+        NumericStats {
+            min: min_val,
+            max: max_val,
+            avg: avg_val,
+        }
     };
+
     log::info!(
-        "get_numeric_stats_by_doc_ids for '{}' took {:?}",
+        "get_numeric_stats_by_doc_ids_refactored for '{}' took {:?}",
         field_name,
         start_time.elapsed()
     );
     Ok(stats)
 }
 
-fn get_numeric_stats(
+// --- REFACTORED get_numeric_stats (Unchanged from previous fix) ---
+fn get_numeric_stats_refactored(
     field_name: &str,
     file_path: &str,
     low_memory: bool,
 ) -> PolarsResult<NumericStats> {
-    println!("Querying get_numeric_stats for field '{}'", field_name);
+    println!(
+        "Querying get_numeric_stats_refactored for field '{}'",
+        field_name
+    );
     let start_time = Instant::now();
     let args = ScanArgsParquet {
         low_memory,
         ..Default::default()
     };
     let lf = LazyFrame::scan_parquet(file_path, args)?;
-
-    // Convert field name to column name format
     let column_name = field_name_to_column(field_name);
-    let numeric_expr = col(&column_name).cast(DataType::Float64);
 
+    let numeric_expr_int = col(&column_name);
+    let numeric_expr_float = numeric_expr_int.clone().cast(DataType::Float64);
     let result_lf = lf.select([
-        numeric_expr.clone().min().alias("min"),
-        numeric_expr.clone().max().alias("max"),
-        numeric_expr.mean().alias("avg"),
+        numeric_expr_int
+            .clone()
+            .min()
+            .cast(DataType::Float64)
+            .alias("min"),
+        numeric_expr_int
+            .clone()
+            .max()
+            .cast(DataType::Float64)
+            .alias("max"),
+        numeric_expr_float.mean().alias("avg"),
     ]);
 
     let df = result_lf.collect()?;
     println!(
-        "Collected DataFrame for get_numeric_stats, height: {}",
+        "Collected DataFrame for get_numeric_stats_refactored, height: {}",
         df.height()
     );
 
-    if df.height() == 0 {
-        return Ok(NumericStats {
+    let stats = if df.height() == 0 {
+        NumericStats {
             min: None,
             max: None,
             avg: None,
-        });
-    }
-
-    // Extract values safely
-    let min_val = df
-        .column("min")?
-        .get(0)
-        .and_then(|av| av.try_extract::<f64>())
-        .ok();
-    let max_val = df
-        .column("max")?
-        .get(0)
-        .and_then(|av| av.try_extract::<f64>())
-        .ok();
-    let avg_val = df
-        .column("avg")?
-        .get(0)
-        .and_then(|av| av.try_extract::<f64>())
-        .ok();
-
-    let stats = NumericStats {
-        min: min_val,
-        max: max_val,
-        avg: avg_val,
+        }
+    } else {
+        let min_val = df.column("min")?.f64()?.get(0);
+        let max_val = df.column("max")?.f64()?.get(0);
+        let avg_val = df.column("avg")?.f64()?.get(0);
+        NumericStats {
+            min: min_val,
+            max: max_val,
+            avg: avg_val,
+        }
     };
+
     log::info!(
-        "get_numeric_stats for '{}' took {:?}",
+        "get_numeric_stats_refactored for '{}' took {:?}",
         field_name,
         start_time.elapsed()
     );
     Ok(stats)
 }
 
+// --- Main Function (Unchanged from previous fix) ---
 fn main() -> PolarsResult<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // --- Configuration ---
     let num_records = 10_000_000;
-    let parquet_file_path = "output_log_data.parquet";
-    let compression = ParquetCompression::Zstd(None); // Zstd default level
-    let row_group_size = Some(512000); // 128 MiB
-    let low_memory = true; // Memory-efficient mode
+    let parquet_file_path = "output_log_data_optimized_fixed.parquet"; // Changed filename
+    let compression = ParquetCompression::Zstd(None);
+    let row_group_size = Some(512 * 1024);
+    let low_memory = std::env::args().any(|arg| arg == "--low-memory=true");
 
-    // --- Phase 1: Data Generation ---
     log::info!("Generating {} records...", num_records);
     let gen_start = Instant::now();
     let base_time = Utc::now();
@@ -585,69 +678,89 @@ fn main() -> PolarsResult<()> {
         gen_start.elapsed()
     );
 
-    // --- Phase 2: Parquet Writing ---
     log::info!(
-        "Writing records to single Parquet file: {}",
+        "Writing records to single Parquet file (Optimized & Fixed): {}",
         parquet_file_path
     );
-    write_records_to_single_parquet(
-        data, // data is moved here
+    write_records_to_single_parquet_optimized(
+        data,
         parquet_file_path,
         compression,
         row_group_size,
     )?;
-    log::info!("Parquet writing complete. Original data vector dropped.");
+    log::info!("Parquet writing complete.");
 
-    sleep(Duration::from_secs(30));
+    log::info!("Pausing for 5 seconds before querying...");
+    std::thread::sleep(StdDuration::from_secs(5));
 
-    // --- Phase 4: Querying ---
     log::info!("Starting queries (low_memory = {})...", low_memory);
 
-    // Example Query 1: Get values for 'level' field for specific doc_ids
-    let query_doc_ids: Vec<i64> = (0..100).map(|i| i * 1000).collect(); // Sample 100 doc ids
-    match get_field_values_by_doc_ids("level", &query_doc_ids, parquet_file_path, low_memory) {
-        Ok(result) => log::info!("Result for get_field_values_by_doc_ids('level', specific_ids): {} unique levels found.", result.value_map.len()),
-        Err(e) => log::error!("Error querying field values by doc_ids: {}", e),
-    }
-    match get_field_values_by_doc_ids("source_region", &query_doc_ids, parquet_file_path, low_memory) {
-        Ok(result) => log::info!("Result for get_field_values_by_doc_ids('source_region', specific_ids): {} unique regions found.", result.value_map.len()),
-        Err(e) => log::error!("Error querying nested field values by doc_ids: {}", e),
-    }
+    let query_doc_ids: Vec<i64> = (0..100).map(|i| i * (num_records / 100) as i64).collect();
 
-    // Example Query 2: Get all values for 'source_host' field
-    match get_field_values("source_host", parquet_file_path, low_memory) {
+    match get_field_values_by_doc_ids_refactored(
+        "level",
+        &query_doc_ids,
+        parquet_file_path,
+        low_memory,
+    ) {
         Ok(result) => log::info!(
-            "Result for get_field_values('source_host'): {} unique hosts found.",
+            "Result for get_field_values_by_doc_ids_refactored('level', specific_ids): {} unique levels found.",
             result.value_map.len()
         ),
-        Err(e) => log::error!("Error querying field values: {}", e),
+        Err(e) => log::error!("Error querying field values by doc_ids (level): {}", e),
+    }
+    match get_field_values_by_doc_ids_refactored(
+        "source_region",
+        &query_doc_ids,
+        parquet_file_path,
+        low_memory,
+    ) {
+        Ok(result) => log::info!(
+            "Result for get_field_values_by_doc_ids_refactored('source_region', specific_ids): {} unique regions found.",
+            result.value_map.len()
+        ),
+        Err(e) => log::error!("Error querying field values by doc_ids (region): {}", e),
     }
 
-    // Example Query 3: Get numeric stats for 'payload_size' for specific doc_ids
-    match get_numeric_stats_by_doc_ids(
+    match get_field_values_refactored("source_host", parquet_file_path, low_memory) {
+        Ok(result) => log::info!(
+            "Result for get_field_values_refactored('source_host'): {} unique hosts found.",
+            result.value_map.len()
+        ),
+        Err(e) => log::error!("Error querying field values (host): {}", e),
+    }
+
+    match get_numeric_stats_by_doc_ids_refactored(
         "payload_size",
         &query_doc_ids,
         parquet_file_path,
         low_memory,
     ) {
         Ok(stats) => log::info!(
-            "Result for get_numeric_stats_by_doc_ids('payload_size', specific_ids): {:?}",
+            "Result for get_numeric_stats_by_doc_ids_refactored('payload_size', specific_ids): {:?}",
             stats
         ),
-        Err(e) => log::error!("Error querying numeric stats by doc_ids: {}", e),
+        Err(e) => log::error!("Error querying numeric stats by doc_ids (payload): {}", e),
     }
-    match get_numeric_stats_by_doc_ids("user_metrics_login_time_ms", &query_doc_ids, parquet_file_path, low_memory) {
-        Ok(stats) => log::info!("Result for get_numeric_stats_by_doc_ids('user_metrics_login_time_ms', specific_ids): {:?}", stats),
-        Err(e) => log::error!("Error querying nested numeric stats by doc_ids: {}", e),
+    match get_numeric_stats_by_doc_ids_refactored(
+        "user_metrics_login_time_ms",
+        &query_doc_ids,
+        parquet_file_path,
+        low_memory,
+    ) {
+        Ok(stats) => log::info!(
+            "Result for get_numeric_stats_by_doc_ids_refactored('user_metrics_login_time_ms', specific_ids): {:?}",
+            stats
+        ),
+        Err(e) => log::error!("Error querying numeric stats by doc_ids (login_time): {}", e),
     }
 
-    // Example Query 4: Get overall numeric stats for 'user_metrics_clicks'
-    match get_numeric_stats("user_metrics_clicks", parquet_file_path, low_memory) {
+    match get_numeric_stats_refactored("user_metrics_clicks", parquet_file_path, low_memory) {
         Ok(stats) => log::info!(
-            "Result for get_numeric_stats('user_metrics_clicks'): {:?}",
+            "Result for get_numeric_stats_refactored('user_metrics_clicks'): {:?}",
             stats
         ),
-        Err(e) => log::error!("Error querying numeric stats: {}", e),
+        Err(e) => log::error!("Error querying numeric stats (clicks): {}", e),
     }
 
     log::info!("Query examples finished.");

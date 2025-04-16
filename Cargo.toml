@@ -5,7 +5,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-polars = { version = "0.43", features = ["parquet", "lazy", "dtype-struct", "json", "performant", "dynamic_group_by", "is_in"] }
+polars = { version = "0.43", features = ["parquet", "lazy", "dtype-struct", "json", "performant", "dynamic_group_by", "is_in", "dtype-categorical", "dtype-array"] }
+hashbrown = { version = "=0.14.5", features = ["raw"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.8"
