@@ -1,28 +1,28 @@
+# Cargo.toml
 [package]
-name = "polars_mem_bench"
+name = "polars_doc_benchmark"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-polars = { version = "0.39.0", features = [ 
-    "lazy",
-    "parquet",
-    "json",
-    "dtype-struct", # Needed for nested JSON -> Struct conversion
-    "random",       # For DataFrame sampling if needed, used here for ID generation
-    "is_in",        # For the filter expression
-]}
-rand = "0.8"
+polars = { version = "0.43", features = ["parquet", "lazy", "dtype-struct", "json", "performant", "dynamic_group_by", "is_in"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = "0.4" # For timestamp generation
-uuid = { version = "1.8", features = ["v4"] }
-tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.8"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+log = "0.4"
+env_logger = "0.11"
 
-# --- For approximate memory stats using jemalloc ---
-jemallocator = "0.5"
-jemalloc-ctl = "0.5"
+# Optional: For potentially better memory allocation performance/profiling
+# jemallocator = { version = "0.5", features = ["profiling"] }
 
-# --- Optional: Enable mimalloc (alternative allocator, sometimes faster) ---
-# [dependencies.mimalloc]
-# version = "0.1"
-# default-features = false
+# Optional: For memory stats reporting
+# memory-stats = "1.1"
+
+[profile.release]
+lto = true          # Link-Time Optimization
+codegen-units = 1   # Maximize optimization opportunities
+panic = 'abort'     # Smaller binary, potentially faster
+strip = true        # Strip symbols
