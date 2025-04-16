@@ -1,0 +1,28 @@
+[package]
+name = "polars_mem_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+polars = { version = "0.39.0", features = [ 
+    "lazy",
+    "parquet",
+    "json",
+    "dtype-struct", # Needed for nested JSON -> Struct conversion
+    "random",       # For DataFrame sampling if needed, used here for ID generation
+    "is_in",        # For the filter expression
+]}
+rand = "0.8"
+serde_json = "1.0"
+chrono = "0.4" # For timestamp generation
+uuid = { version = "1.8", features = ["v4"] }
+tokio = { version = "1", features = ["full"] }
+
+# --- For approximate memory stats using jemalloc ---
+jemallocator = "0.5"
+jemalloc-ctl = "0.5"
+
+# --- Optional: Enable mimalloc (alternative allocator, sometimes faster) ---
+# [dependencies.mimalloc]
+# version = "0.1"
+# default-features = false
